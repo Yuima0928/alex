@@ -1,32 +1,32 @@
 import sqlite3
 import numpy as np
 import faiss
-from multiprocessing import Pool
+from sentence_transformers import SentenceTransformer
 import time
 import matplotlib.pyplot as plt
 
 # 計算対象のTopNリスト
-topN_list = [10, 15, 20, 25, 30]
+topN = 10
 
 # グローバル変数の初期化
-paper_number = 10000
+paper_number = 1000
+start_time = time.time()
 index = faiss.read_index("./faiss_index_with_all_faster.index")
+end_time = time.time()
+print(f"Execution time: {end_time - start_time:.2f} seconds")
 print("FAISS index loaded successfully.")
 
 # Precision/Recall計算用関数
-def calculate_precision_recall(args):
-    attention_paper_id, attention_reference_works = args
+def pick_up_top_papers_id(input):
+    start_time = time.time()
+    embedding = model.encode([input], batch_size=1) 
+    end_time = time.time()
+    print(f"embeddingExecution time: {end_time - start_time:.2f} seconds")
 
-    conn = sqlite3.connect('./paper_with_topic_indexed_new.db')
-    cursor = conn.cursor()
-
-    # 対象論文のベクトルを取得
-    cursor.execute("SELECT vector FROM PaperVectors WHERE paper_id = ?;", (attention_paper_id,))
-    attention_vector = np.frombuffer(cursor.fetchone()[0], dtype=np.float32)
-
+    start_time = time.time()
     # FAISS検索
     index.nprobe = 10
-    distances, indices = index.search(attention_vector.reshape(1, -1), paper_number + 1)
+    distances, indices = index.search(embedding.reshape(1, -1), paper_number) # 取り除く必要ないから + 1なしで
 
     # 上位の類似論文を取得
     top_1000_papers = []
@@ -36,7 +36,7 @@ def calculate_precision_recall(args):
             continue
         cursor.execute(query, (int(idx),))
         paper_id = cursor.fetchone()
-        if paper_id and paper_id[0] != attention_paper_id:
+        if paper_id:
             top_1000_papers.append((paper_id[0], distances[0][i]))
 
     if len(top_1000_papers) == 0:
@@ -79,6 +79,9 @@ def calculate_precision_recall(args):
             break
         pagerank_vector = new_pagerank_vector
 
+    end_time = time.time()
+    print(f"pagerank embeddingExecution time: {end_time - start_time:.2f} seconds")
+
     # Precision/Recall計算
     precision_results = []
     recall_results = []
@@ -97,75 +100,29 @@ def calculate_precision_recall(args):
         for i in range(len(top_1000_papers))
     ]
 
-    for topN in topN_list:
-        if topN > len(top_1000_papers):
-            continue
+    top_indices = np.argsort(final_score)[-topN:][::-1]
+    top_papers_id = [top_1000_papers[i][0] for i in top_indices]
 
-        top_indices = np.argsort(final_score)[-topN:][::-1]
-        top_papers_id = [top_1000_papers[i][0] for i in top_indices]
-
-        common = sum(1 for ref_id in attention_reference_works if ref_id in top_papers_id)
-        precision = common / topN if topN > 0 else 0
-        recall = common / len(attention_reference_works) if attention_reference_works else 0
-
-        precision_results.append(precision)
-        recall_results.append(recall)
-
-    conn.close()
-    return precision_results, recall_results
-
-# 並列計算関数
-def parallel_process():
-    conn = sqlite3.connect('./paper_with_topic_indexed_new.db')
-    cursor = conn.cursor()
-
-    flag, count = 0, 0
-    tasks = []
-    while flag < 50:
-        cursor.execute('SELECT paper_id FROM PaperVectors LIMIT 1 OFFSET ?', (count + 2000000,))
-        row = cursor.fetchone()
-        if not row:
-            break
-
-        attention_paper_id = row[0]
-        cursor.execute('SELECT referenced_paper_id FROM ReferencedWorks WHERE paper_id = ?', (attention_paper_id,))
-        attention_reference_works = [r[0] for r in cursor.fetchall()]
-
-        if attention_reference_works:
-            tasks.append((attention_paper_id, attention_reference_works))
-            flag += 1
-        count += 1
-
-    conn.close()
-
-    with Pool(processes=16) as pool:  # 16プロセスで並列化
-        results = pool.map(calculate_precision_recall, tasks)
-
-    return results
+    return top_papers_id
 
 if __name__ == "__main__":
-    start_time = time.time()
-    results = parallel_process()
+    conn = sqlite3.connect('./paper_with_topic_indexed_new.db')
+    cursor = conn.cursor()
+    model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu") # cudaにしたら、時間はかかる。でも"cpu"だとkilledされることがある。
+    # start_time = time.time()
+    for i in range(3):
 
-    # 結果を集計
-    all_precisions = [result[0] for result in results if result]
-    all_recalls = [result[1] for result in results if result]
+        print("input your research:")
+        text = input()
+        start_time = time.time()
+        top_papers_id = pick_up_top_papers_id(text)
+        end_time = time.time()
+        print(f"{i}回目 Execution time: {end_time - start_time:.2f} seconds")
 
-    mean_precisions = np.mean(all_precisions, axis=0)
-    mean_recalls = np.mean(all_recalls, axis=0)
-    print(mean_precisions)
-    print(mean_recalls)
-    # 結果をプロット
-    plt.figure(figsize=(12, 6))
-    plt.plot(topN_list, mean_precisions, marker='o', label='Precision')
-    plt.plot(topN_list, mean_recalls, marker='o', label='Recall')
-    plt.xlabel('Top N')
-    plt.ylabel('Scores')
-    plt.title('Precision and Recall')
-    plt.legend()
-    plt.grid()
-    plt.savefig("precision_recall_parallel_all_attention_all_10000.png")
-    plt.show()
-
-    end_time = time.time()
-    print(f"Execution time: {end_time - start_time:.2f} seconds")
+        with open("output.txt", "w", encoding="utf-8") as f:
+            for top_paper_id in top_papers_id:
+                cursor.execute('SELECT title, abstract FROM PaperVectors WHERE paper_id is ?', (top_paper_id,))
+                title, abstract = cursor.fetchone()
+                f.write(f"paper_id: {top_paper_id}\n")
+                f.write(f"  title: {title}\n")
+                f.write(f"  abstract: {abstract}\n")

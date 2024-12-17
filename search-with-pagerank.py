@@ -60,16 +60,16 @@ def calculate_precision_recall(attention_paper_id, attention_reference_works):
     a_vector = [[] for i in range(paper_number)]
     sum_edge_per_paper = [0 for i in range(paper_number)]
 
-    count = 0
     for paper_id, _ in top_1000_papers:
-        for attention_reference_works_id in attention_reference_works:
-            if check_paper_in_network(attention_reference_works_id):
-                if attention_reference_works_id == paper_id:
+        cursor.execute('SELECT referenced_paper_id FROM ReferencedWorks WHERE paper_id = ?', (paper_id,))
+        reference_works = [r[0] for r in cursor.fetchall()]
+        for ref_id in reference_works:
+            if ref_id in top_1000_dict:
+                if ref_id == paper_id:
                     continue
-                count += 1
                 sum_edge_per_paper[top_1000_dict[paper_id]] += 1
-                a_vector[top_1000_dict[paper_id]].append([top_1000_dict[attention_reference_works_id], 1])
-
+                a_vector[top_1000_dict[paper_id]].append([top_1000_dict[ref_id], 1])
+    
     for i in range(paper_number):
         if sum_edge_per_paper[i] > 0:
             for sub_a_vector in a_vector[i]:
@@ -183,7 +183,7 @@ def calculate_ref_counts(attention_paper_id, attention_reference_works):
     return ref_count
 
 # インデックスをロード
-index = faiss.read_index("./faiss_index_with_medicine_faster.index")
+index = faiss.read_index("./faiss_index_with_all_faster.index")
 print("FAISS index loaded successfully.")
 
 precisions = []
@@ -199,15 +199,15 @@ while(flag < 50):
     count += 1
 
     cursor.execute('SELECT referenced_paper_id FROM ReferencedWorks WHERE paper_id = ?', (attention_paper_id,))
-    referenced_papers = [row[0] for row in cursor.fetchall()]
-    if (len(referenced_papers) != 0):
+    attention_reference_works = [row[0] for row in cursor.fetchall()]
+    if (len(attention_reference_works) != 0):
         flag += 1
-        sum_ref += len(referenced_papers)
-        common, precision, recall = calculate_precision_recall(attention_paper_id, referenced_papers)
+        sum_ref += len(attention_reference_works)
+        common, precision, recall = calculate_precision_recall(attention_paper_id, attention_reference_works)
         precisions.append(precision)
         recalls.append(recall)
 
-        ref_counts.append(calculate_ref_counts(attention_paper_id, referenced_papers) + common[::-1])
+        ref_counts.append(calculate_ref_counts(attention_paper_id, attention_reference_works) + common[::-1])
 
 output_file = "./results/precision_recall_cs_20_ave.png"
 

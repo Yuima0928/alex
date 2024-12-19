@@ -126,3 +126,5 @@ if __name__ == "__main__":
                 f.write(f"paper_id: {top_paper_id}\n")
                 f.write(f"  title: {title}\n")
                 f.write(f"  abstract: {abstract}\n")
+
+    conn.close()

@@ -16,7 +16,6 @@ end_time = time.time()
 print(f"Execution time: {end_time - start_time:.2f} seconds")
 print("FAISS index loaded successfully.")
 
-# Precision/Recall計算用関数
 def pick_up_top_papers_id(input):
     start_time = time.time()
     embedding = model.encode([input], batch_size=1) 

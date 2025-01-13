@@ -50,6 +50,7 @@ npm start
 ## 実行方法
 1. **事前処理**
 ```bash
+mkdir data
 cd data
 aws s3 sync "s3://openalex" "openalex-snapshot" --no-sign-request
 cd ..

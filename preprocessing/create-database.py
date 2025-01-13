@@ -3,15 +3,17 @@ import gzip
 import json
 import glob
 from multiprocessing import get_context
-from sentence_transformers import SentenceTransformer
-from datetime import datetime
+from datetime import date, timedelta
 import time
 import os
+import torch
+from itertools import chain
+from sentence_transformers import SentenceTransformer
 
 # .gzipファイルのパスを取得
-input_files = glob.glob('../works/*/*.gz')
-authors_input_files = glob.glob('../authors/*/*.gz')
-institutions_input_files = glob.glob('../institutions/*/*.gz')
+input_files = glob.glob('../data/openalex-snapshot/data/works/*/*.gz')
+authors_input_files = glob.glob('../data/openalex-snapshot/data/authors/*/*.gz')
+institutions_input_files = glob.glob('../data/openalex-snapshot/data/institutions/*/*.gz')
 
 # JSONファイルから辞書を読み込む
 with open("domain_to_number.json", "r", encoding="utf-8") as f:
@@ -123,16 +125,16 @@ def process_institution_file(args):
 
 # 論文データを処理して一時データベースに保存する関数
 def process_file(args):
-    input_file, batch_size, temp_db_path = args
+    input_file, batch_size, temp_db_path, gpu_id = args
     
-    device = "cpu"  # 明示的にCPUを使用
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
     connection = sqlite3.connect(temp_db_path)
     cursor = connection.cursor()
 
     print(f"Processing file: {input_file} on {device}")
     with gzip.open(input_file, 'rt', encoding='utf-8') as f_in:
-        paper_ids, sentences, publication_years, publication_months, publication_days = [], [], [], [], []
+        paper_ids, sentences = [], []
         abstracts , titles = [], []
         institution_ids, embeddings = [], []
         topics_array_data = []
@@ -140,6 +142,7 @@ def process_file(args):
         author_ids = []
         topics_counts = []
         topic_paper_ids = []
+        date_objs = []
 
         for line in f_in:
             try:
@@ -155,16 +158,18 @@ def process_file(args):
             abstract = ""
             title = record.get("title", "")
             if abstract_inverted_index:
-                words = sorted(abstract_inverted_index.items(), key=lambda x: x[1][0])
-                abstract = " ".join([word[0] for word in words])
+                # すべての位置と単語を抽出し、位置情報に基づいてソート
+                sorted_words = sorted(chain.from_iterable(
+                    [(pos, word) for pos in positions] for word, positions in abstract_inverted_index.items()
+                ), key=lambda x: x[0])
+
+                # ソートされた単語リストから単語を連結してテキストを再構築
+                abstract = " ".join(word for _, word in sorted_words)
             
-            sentence = title + " " + abstract
+            sentence = (title or "") + " " + (abstract or "")
 
             publication_date = record.get("publication_date", "")
-            date_obj = datetime.strptime(publication_date, "%Y-%m-%d")
-            publication_year = date_obj.year
-            publication_month = date_obj.month
-            publication_day = date_obj.day
+            date_obj = date.fromisoformat(publication_date)
 
             referenced_works = record.get("referenced_works", [])
             topics_count = record.get("topics_count", "")
@@ -173,13 +178,16 @@ def process_file(args):
             topics_array = []
             for topic in topics:
                 domain = 0
-                domain = domain_to_number.get(topic["domain"].get("display_name", ""), 0)
+                if "domain" in topic and topic["domain"]:
+                    domain = domain_to_number.get(topic["domain"].get("display_name", ""), 0)
 
                 field = 0
-                field = field_to_number.get(topic["field"].get("display_name", ""), 0)
+                if "field" in topic and topic["field"]:
+                    field = field_to_number.get(topic["field"].get("display_name", ""), 0)
 
                 subfield = 0
-                subfield = subfield_to_number.get(topic["subfield"].get("display_name", ""), 0)
+                if "subfield" in topic and topic["subfield"]:
+                    subfield = subfield_to_number.get(topic["subfield"].get("display_name", ""), 0)
 
                 topics_array.append([domain, field, subfield])
 
@@ -197,16 +205,14 @@ def process_file(args):
                 sentences.append(sentence)
                 abstracts.append(abstract)
                 titles.append(title)
-                publication_years.append(publication_year)
-                publication_months.append(publication_month)
-                publication_days.append(publication_day)
                 topics_counts.append(topics_count)
                 institution_ids.append(institution_id)
                 author_ids.append(author_id)
+                date_objs.append(date_obj)
 
                 # 参照関係を保存
                 for ref in referenced_works:
-                    referenced_works_data.append((paper_id, ref))
+                    referenced_works_data.append((date_obj, paper_id, ref))
 
                 for topics in topics_array:
                     topics_array_data.append((paper_id, topics[0], topics[1], topics[2]))
@@ -216,13 +222,13 @@ def process_file(args):
                 embeddings = model.encode(sentences, batch_size=batch_size)
                 for i, embedding in enumerate(embeddings):
                     cursor.execute('''
-                        INSERT OR IGNORE INTO PaperVectors (paper_id, title, abstract, vector, publication_year, publication_month, publication_day, topics_count, author_id, institution_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (paper_ids[i], titles[i], abstracts[i], embedding.flatten().tobytes(), publication_years[i], publication_months[i], publication_days[i],  topics_counts[i], author_ids[i], institution_ids[i]))
+                        INSERT OR IGNORE INTO PaperVectors (created_date, paper_id, title, abstract, vector, topics_count, author_id, institution_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (date_objs[i], paper_ids[i], titles[i], abstracts[i], embedding.flatten().tobytes(), topics_counts[i], author_ids[i], institution_ids[i]))
 
                 cursor.executemany('''
-                    INSERT OR IGNORE INTO ReferencedWorks (paper_id, referenced_paper_id)
-                    VALUES (?, ?)
+                    INSERT OR IGNORE INTO ReferencedWorks (created_date, paper_id, referenced_paper_id)
+                    VALUES (?, ?, ?)
                 ''', referenced_works_data)
 
                 cursor.executemany('''
@@ -231,23 +237,24 @@ def process_file(args):
                 ''', topics_array_data)
 
                 connection.commit()
-                paper_ids, sentences, publication_years, publication_months, publication_days, topics_counts, author_ids, institution_ids, embeddings = [], [], [], [], [], [], [], [], []
-                referenced_works_data = []
+                paper_ids, sentences, topics_counts, author_ids, institution_ids, embeddings = [], [], [], [], [], []
                 topics_array_data = []
                 abstracts , titles = [], []
+                date_objs = []
+                referenced_works_data = []
 
         # 残ったデータの処理
         if sentences:
-            embeddings = model.encode(sentences, batch_size=batch_size)
             for i, embedding in enumerate(embeddings):
+                embeddings = model.encode(sentences, batch_size=batch_size)
                 cursor.execute('''
-                    INSERT OR IGNORE INTO PaperVectors (paper_id, title, abstract, vector, publication_year, publication_month, publication_day, topics_count, author_id, institution_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (paper_ids[i], titles[i], abstracts[i], embedding.flatten().tobytes(), publication_years[i], publication_months[i], publication_days[i], topics_counts[i],  author_ids[i], institution_ids[i]))
+                    INSERT OR IGNORE INTO PaperVectors (created_date, paper_id, title, abstract, vector, topics_count, author_id, institution_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (date_objs[i], paper_ids[i], titles[i], abstracts[i], embedding.flatten().tobytes(), topics_counts[i],  author_ids[i], institution_ids[i]))
 
             cursor.executemany('''
-                INSERT OR IGNORE INTO ReferencedWorks (paper_id, referenced_paper_id)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO ReferencedWorks (created_date, paper_id, referenced_paper_id)
+                VALUES (?, ?, ?)
             ''', referenced_works_data)
 
             cursor.executemany('''
@@ -256,13 +263,15 @@ def process_file(args):
             ''', topics_array_data)
         
             # データをリセット
-            paper_ids, sentences, publication_years, publication_months, publication_days = [], [], [], [], []
+            paper_ids, sentences = [], []
             topics_counts, author_ids, institution_ids, abstracts, titles = [], [], [], [], []
             referenced_works_data, topics_array_data = [], []
+            date_objs = []
+            embeddings = []
 
             connection.commit()
-
     connection.close()
+    torch.cuda.empty_cache()  # GPUメモリをクリア
 
 def create_authors_table(db_path):
     connection = sqlite3.connect(db_path)
@@ -332,13 +341,11 @@ def create_tables(db_path):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS PaperVectors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_date DATETIME,
             paper_id TEXT UNIQUE,
             title TEXT,
             abstract TEXT,
             vector BLOB,
-            publication_year INTEGER,
-            publication_month INTEGER,
-            publication_day INTEGER,
             topics_count INTEGER,
             author_id TEXT,
             institution_id TEXT,
@@ -366,6 +373,7 @@ def create_tables(db_path):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ReferencedWorks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_date DATETIME,
             paper_id TEXT,
             referenced_paper_id TEXT,
             FOREIGN KEY(paper_id) REFERENCES PaperVectors(paper_id)
@@ -467,21 +475,21 @@ def merge_databases(temp_dbs, main_db_path):
         temp_cursor = temp_conn.cursor()
 
         # `PaperVectors` のデータをバッチで挿入
-        temp_cursor.execute('SELECT paper_id, title, abstract, vector, publication_year, publication_month, publication_day, topics_count, author_id, institution_id FROM PaperVectors')
+        temp_cursor.execute('SELECT created_date, paper_id, title, abstract, vector, topics_count, author_id, institution_id FROM PaperVectors')
         rows = temp_cursor.fetchall()
         if rows:
             main_cursor.executemany('''
-                INSERT OR IGNORE INTO PaperVectors (paper_id, title, abstract, vector, publication_year, publication_month, publication_day, topics_count, author_id, institution_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO PaperVectors (created_date, paper_id, title, abstract, vector, topics_count, author_id, institution_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
         # `ReferencedWorks` のデータをバッチで挿入
-        temp_cursor.execute('SELECT paper_id, referenced_paper_id FROM ReferencedWorks')
+        temp_cursor.execute('SELECT created_date, paper_id, referenced_paper_id FROM ReferencedWorks')
         ref_rows = temp_cursor.fetchall()
         if ref_rows:
             main_cursor.executemany('''
-                INSERT OR IGNORE INTO ReferencedWorks (paper_id, referenced_paper_id)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO ReferencedWorks (created_date, paper_id, referenced_paper_id)
+                VALUES (?, ?, ?)
             ''', ref_rows)
 
         # `Topics` のデータをバッチで挿入
@@ -574,7 +582,7 @@ def main(input_files, authors_input_files, institutions_input_files, batch_size=
         print("No .gz file found at the specified path.")
         return
 
-    main_db_path = 'paper.db'
+    main_db_path = 'paper2.db'
 
     # authorテーブルを作る
     create_authors_table(main_db_path)
@@ -591,6 +599,8 @@ def main(input_files, authors_input_files, institutions_input_files, batch_size=
     merge_author_databases(temp_dbs, main_db_path)
     create_index(main_db_path, 'Authors', 'author_id', 'idx_author_id')
     create_index(main_db_path, 'AuthorsYearCount', 'author_id', 'idx_author_year_count_id')
+    create_index(main_db_path, 'AuthorsYearCount', 'year', 'idx_author_year')
+
 
     # institutionテーブルを作る
     create_institutions_table(main_db_path)
@@ -607,6 +617,8 @@ def main(input_files, authors_input_files, institutions_input_files, batch_size=
     merge_institution_databases(temp_dbs, main_db_path)
     create_index(main_db_path, 'Institutions', 'institution_id', 'idx_institution_id')
     create_index(main_db_path, 'InstitutionsYearCount', 'institution_id', 'idx_institution_year_count_id')
+    create_index(main_db_path, 'InstitutionsYearCount', 'year', 'idx_institution_year')
+
 
     # JSONファイルの読み込み
     domain_to_number = load_json("domain_to_number.json")
@@ -624,7 +636,9 @@ def main(input_files, authors_input_files, institutions_input_files, batch_size=
 
     start_time = time.time()
 
-    args = [(input_files[i], batch_size, temp_dbs[i]) for i in range(len(input_files))]
+    # 引数を設定（GPUをラウンドロビン方式で割り当て）
+    gpu_count = torch.cuda.device_count()
+    args = [(input_files[i], batch_size, temp_dbs[i], i % gpu_count) for i in range(len(input_files))]
 
     with get_context("spawn").Pool(processes=num_processes) as pool:
         pool.map(process_file, args)
@@ -632,11 +646,11 @@ def main(input_files, authors_input_files, institutions_input_files, batch_size=
         pool.join()
     merge_databases(temp_dbs, main_db_path)
     create_index(main_db_path, 'PaperVectors', 'paper_id', 'idx_paper_id')
-    create_index(main_db_path, 'PaperVectors', 'publication_year', 'idx_publication_year')
+    create_index(main_db_path, 'PaperVectors', 'created_date', 'idx_created_date')
+    create_index(main_db_path, 'ReferencedWorks', 'created_date', 'idx_referenced_created_date')
     create_index(main_db_path, 'ReferencedWorks', 'paper_id', 'idx_referenced_paper_id')
     create_index(main_db_path, 'ReferencedWorks', 'referenced_paper_id', 'idx_referencedworks_referenced_paper_id') 
     create_index(main_db_path, 'Topics', 'paper_id', 'idx_topics_paper_id')
-
 
     connection = sqlite3.connect(main_db_path)
     cursor = connection.cursor()
